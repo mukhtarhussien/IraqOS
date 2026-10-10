@@ -1,0 +1,7 @@
+#ifndef IRAQOS_DISPLAY_SIZE_H
+#define IRAQOS_DISPLAY_SIZE_H
+#define FB_WIDTH 2256
+#define FB_HEIGHT 1080
+#define UI_HEIGHT 768
+#define UI_WIDTH ((FB_WIDTH * UI_HEIGHT) / FB_HEIGHT)
+#endif
