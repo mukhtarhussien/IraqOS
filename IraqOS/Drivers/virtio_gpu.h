@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include "display_size.h"
 
-void virtio_gpu_init(void);
+void virtio_gpu_init(const void *fdt);
 int virtio_gpu_is_ready(void);
 void virtio_gpu_flush(void);
 void fb_put_pixel(int x, int y, uint32_t color);

@@ -6,7 +6,7 @@ from pathlib import Path
 
 out = Path(sys.argv[1])
 width, height = 1024, 768
-display_name = os.environ.get("DISPLAY") or ":0"
+display_name = os.environ.get("DISPLAY") or ":2"
 try:
     x11 = ctypes.CDLL("libX11.so")
     x11.XOpenDisplay.argtypes = [ctypes.c_char_p]

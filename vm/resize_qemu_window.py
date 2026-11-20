@@ -70,7 +70,7 @@ x_error_handler = XErrorHandler(handle_x_error)
 
 try:
     target_pid = int(sys.argv[1])
-    sys_display = __import__("os").environ.get("DISPLAY", ":0")
+    sys_display = __import__("os").environ.get("DISPLAY", ":2")
     dpy = x11.XOpenDisplay(sys_display.encode())
     if not dpy:
         raise SystemExit(0)

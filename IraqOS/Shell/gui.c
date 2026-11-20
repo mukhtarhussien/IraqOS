@@ -3,6 +3,7 @@
 #include "../Drivers/uart.h"
 #include "../Drivers/virtio_gpu.h"
 #include "../Drivers/virtio_input.h"
+#include "shell.h"
 
 #define BG       0xFF101820u
 #define PANEL    0xFF182430u
@@ -28,10 +29,14 @@ static int terminal_y = 76;
 static int terminal_drag_dirty;
 static char (*active_terminal_log)[TERM_COLS];
 static const char *active_terminal_username;
+static char active_terminal_input[128];
+static int keyboard_shift;
+static int keyboard_caps_lock;
 static int same_word(const char *a, const char *b);
 static void pointer_hide(void);
 static void pointer_show(void);
 static int poll_mouse_click(void);
+static void draw_terminal_input_line(void);
 static void draw_terminal_window(const char *username,
                                  char log[TERM_ROWS][TERM_COLS],
                                  int maximized);
@@ -681,6 +686,46 @@ static void show_start_menu(const char *username)
     console_present();
 }
 
+static char keyboard_ascii(uint16_t code, int shifted)
+{
+    static const char plain[] = "1234567890-=";
+    static const char upper[] = "!@#$%^&*()_+";
+    if (code >= 2 && code <= 13) return shifted ? upper[code - 2] : plain[code - 2];
+    if (code >= 16 && code <= 25) {
+        static const char row[] = "qwertyuiop";
+        char c = row[code - 16];
+        return (shifted ^ keyboard_caps_lock) ? c - 32 : c;
+    }
+    if (code >= 30 && code <= 38) {
+        static const char row[] = "asdfghjkl";
+        char c = row[code - 30];
+        return (shifted ^ keyboard_caps_lock) ? c - 32 : c;
+    }
+    if (code >= 44 && code <= 50) {
+        static const char row[] = "zxcvbnm";
+        char c = row[code - 44];
+        return (shifted ^ keyboard_caps_lock) ? c - 32 : c;
+    }
+    switch (code) {
+    case 14: return '\b';
+    case 28: return '\n';
+    case 57: return ' ';
+    case 26: return shifted ? '{' : '[';
+    case 27: return shifted ? '}' : ']';
+    case 39: return shifted ? ':' : ';';
+    case 40: return shifted ? '"' : '\'';
+    case 41: return shifted ? '~' : '`';
+    case 43: return shifted ? '|' : '\\';
+    case 51: return shifted ? '<' : ',';
+    case 52: return shifted ? '>' : '.';
+    case 53: return shifted ? '?' : '/';
+    case 55: return '*';
+    case 74: return '-';
+    case 78: return '+';
+    default: return 0;
+    }
+}
+
 static void read_desktop_command(char *line, int capacity)
 {
     int n = 0;
@@ -710,8 +755,30 @@ static void read_desktop_command(char *line, int capacity)
             mouse_click_command(line, capacity);
             if (line[0]) { uart_print(line); uart_print("\r\n"); return; }
         }
-        char c;
-        if (!uart_try_getc(&c)) { __asm__ volatile("yield"); continue; }
+
+        char c = 0;
+        int got_char = 0;
+        if (gui_mode == GUI_MODE_TERMINAL && virtio_keyboard_ready()) {
+            struct virtio_input_event key;
+            for (int count = 0; count < 32 && virtio_keyboard_next_event(&key); count++) {
+                if (key.type != IRAQOS_EV_KEY) continue;
+                if (key.code == 42 || key.code == 54) {
+                    keyboard_shift = key.value != 0;
+                    continue;
+                }
+                if (key.code == 58 && key.value == 1) {
+                    keyboard_caps_lock = !keyboard_caps_lock;
+                    continue;
+                }
+                if (key.value != 1 && key.value != 2) continue;
+                c = keyboard_ascii(key.code, keyboard_shift);
+                if (c) { got_char = 1; break; }
+            }
+            virtio_input_kick();
+        }
+        if (!got_char && uart_try_getc(&c)) got_char = 1;
+        if (!got_char) { __asm__ volatile("yield"); continue; }
+
         if (c == 0x1b) {
             alt_pending = 1;
             continue;
@@ -727,14 +794,24 @@ static void read_desktop_command(char *line, int capacity)
         alt_pending = 0;
         if (c == '\r' || c == '\n') {
             line[n] = '\0';
-            uart_print("\r\n");
+            if (gui_mode != GUI_MODE_TERMINAL) uart_print("\r\n");
+            else draw_terminal_input_line();
             return;
         }
         if (c == '\b' || c == 127) {
-            if (n) { n--; uart_print("\b \b"); }
+            if (n) {
+                n--;
+                if (gui_mode != GUI_MODE_TERMINAL) uart_print("\b \b");
+                else {
+                    line[n] = '\0';
+                    draw_terminal_input_line();
+                }
+            }
         } else if (c >= 32 && c <= 126 && n < capacity - 1) {
             line[n++] = c;
-            uart_putc(c);
+            line[n] = '\0';
+            if (gui_mode != GUI_MODE_TERMINAL) uart_putc(c);
+            else draw_terminal_input_line();
         }
     }
 }
@@ -783,84 +860,44 @@ static void term_add(char log[TERM_ROWS][TERM_COLS], const char *message)
     }
 }
 
-#define HOST_RESULT_MAX 8192
-#define HOST_ACK 0x06
-
-static void terminal_host_command(const char *command,
-                                 char log[TERM_ROWS][TERM_COLS])
+static void terminal_guest_output(const char *text, void *context)
 {
-    char echoed[TERM_COLS];
-    const char *full_command = command;
-    int max = terminal_columns();
-    int n = 0;
-    echoed[n++] = '$';
-    echoed[n++] = ' ';
-    while (*command && n < max && n < TERM_COLS - 1)
-        echoed[n++] = *command++;
-    echoed[n] = '\0';
-    term_add(log, echoed);
-
-    uart_print("\x1eIRAQOS_EXEC:");
-    uart_print(full_command);
-    uart_putc('\x1f');
-
-    static const char response_prefix[] = "\x1eIRAQOS_RESULT:";
-    for (int i = 0; i < (int)sizeof(response_prefix) - 1; i++) {
-        if (uart_getc() != response_prefix[i]) {
-            term_add(log, "TERMINAL LINK ERROR");
-            return;
+    char (*log)[TERM_COLS] = context;
+    char line[TERM_COLS];
+    int used = 0;
+    for (int i = 0; text[i]; i++) {
+        unsigned char c = (unsigned char)text[i];
+        if (c == '\r') continue;
+        if (c == '\n') {
+            line[used] = '\0';
+            term_add(log, line);
+            used = 0;
+        } else if (c == '\t') {
+            if (used < TERM_COLS - 1) line[used++] = ' ';
+        } else if (c >= 32 && c <= 126) {
+            if (used < TERM_COLS - 1) line[used++] = (char)c;
+        } else if (c >= 128 && used < TERM_COLS - 1) {
+            line[used++] = '?';
         }
     }
-    int length = 0;
-    int digits = 0;
-    char c;
-    while ((c = uart_getc()) != '\n') {
-        if (c < '0' || c > '9' || digits >= 5) {
-            term_add(log, "BAD TERMINAL RESPONSE");
-            return;
-        }
-        length = length * 10 + c - '0';
-        digits++;
-    }
-    if (length > HOST_RESULT_MAX) {
-        term_add(log, "TERMINAL RESPONSE TOO LARGE");
-        return;
-    }
-
-    char output_line[TERM_COLS];
-    int line_length = 0;
-    int columns = terminal_columns();
-    for (int offset = 0; offset < length; ) {
-        int chunk = length - offset;
-        if (chunk > 16) chunk = 16;
-        for (int j = 0; j < chunk; j++, offset++) {
-            unsigned char out = (unsigned char)uart_getc();
-            if (out == '\r') continue;
-            if (out == '\n') {
-                output_line[line_length] = '\0';
-                term_add(log, output_line);
-                line_length = 0;
-            } else if (out == '\t') {
-                output_line[line_length++] = ' ';
-            } else if (out >= 32 && out <= 126) {
-                output_line[line_length++] = (char)out;
-            } else if (out >= 128) {
-                output_line[line_length++] = '?';
-            }
-            if (line_length >= columns) {
-                output_line[line_length] = '\0';
-                term_add(log, output_line);
-                line_length = 0;
-            }
-        }
-        uart_putc(HOST_ACK);
-    }
-    if (line_length) {
-        output_line[line_length] = '\0';
-        term_add(log, output_line);
+    if (used) {
+        line[used] = '\0';
+        term_add(log, line);
     }
 }
 
+static void terminal_guest_command(const char *command,
+                                   char log[TERM_ROWS][TERM_COLS])
+{
+    char echoed[TERM_COLS];
+    int n = 0, max = terminal_columns();
+    const char *full_command = command;
+    echoed[n++] = '$'; echoed[n++] = ' ';
+    while (*command && n < max && n < TERM_COLS - 1) echoed[n++] = *command++;
+    echoed[n] = '\0';
+    term_add(log, echoed);
+    shell_execute(full_command, terminal_guest_output, log);
+}
 static void draw_settings_window(void)
 {
     int x = APP_X, y = 130;
@@ -948,7 +985,7 @@ static void draw_terminal_window(const char *username,
     console_draw_text_at(right - 31, y + 14, "X", WHITE);
 
     console_fill_rect(x + 5, y + 48, w - 10, h - 54, 0xFF071018u);
-    console_draw_text_at(x + 24, y + 66, "TERMUX LINUX SHELL", 0xFF71E6A2u);
+    console_draw_text_at(x + 24, y + 66, "IRAQOS GUEST SHELL", 0xFF71E6A2u);
     int row_pitch = 9 * console_get_font_scale() + 8;
     int visible_rows = (h - 176) / row_pitch;
     if (visible_rows > TERM_ROWS) visible_rows = TERM_ROWS;
@@ -961,11 +998,28 @@ static void draw_terminal_window(const char *username,
     }
     console_fill_rect(x + 18, y + h - 68, w - 36, 2, 0xFF244150u);
     console_draw_text_at(x + 24, y + h - 54,
-                         "TERMUX LINUX  |  COMMANDS RUN IN IRAQOS FOLDER", 0xFF77B7CFu);
-    console_draw_text_at(x + 24, y + h - 30,
-                         "MAXIMIZE   X CLOSE", 0xFF77B7CFu);
+                         "IRAQOS DISK  |  LOCAL GUEST COMMANDS", 0xFF77B7CFu);
+    console_fill_rect(x + 17, y + h - 43, w - 34, 34, 0xFF071018u);
+    console_draw_text_at(x + 24, y + h - 30, "iraqos:/ > ", 0xFF77E3A2u);
+    console_draw_text_at(x + 90, y + h - 30, active_terminal_input, 0xFFD9E8EFu);
     (void)username;
     console_present();
+}
+
+static void draw_terminal_input_line(void)
+{
+    if (gui_mode != GUI_MODE_TERMINAL || !active_terminal_log) return;
+    int maximized = gui_terminal_maximized;
+    int x = maximized ? 12 : terminal_x;
+    int y = maximized ? 10 : terminal_y;
+    int w = maximized ? UI_WIDTH - 24 : UI_WIDTH - 160;
+    int h = maximized ? TASKBAR_TOP - y - 8 : 590;
+    pointer_hide();
+    console_fill_rect(x + 17, y + h - 43, w - 34, 34, 0xFF071018u);
+    console_draw_text_at(x + 24, y + h - 30, "iraqos:/ > ", 0xFF77E3A2u);
+    console_draw_text_at(x + 90, y + h - 30, active_terminal_input, 0xFFD9E8EFu);
+    console_present();
+    pointer_show();
 }
 
 static void terminal_window(const char *username)
@@ -977,8 +1031,9 @@ static void terminal_window(const char *username)
     int minimized = 0;
     int desktop_dirty = 0;
     gui_mode = GUI_MODE_TERMINAL;
+    active_terminal_input[0] = '\0';
     term_add(log, "TURTULE TERMINAL 0.4");
-    term_add(log, "CONNECTED TO TERMUX LINUX SHELL");
+    term_add(log, "IRAQOS GUEST SHELL | LOCAL DISK");
     terminal_x = (UI_WIDTH - (UI_WIDTH - 160)) / 2;
     terminal_y = 76;
     active_terminal_log = log;
@@ -998,7 +1053,8 @@ static void terminal_window(const char *username)
             console_present();
         }
         pointer_show();
-        uart_print("TERMINAL [HELP CLEAR MAXIMIZE MINIMIZE RESTORE CLOSE]> ");
+        active_terminal_input[0] = '\0';
+        draw_terminal_input_line();
         read_desktop_command(command, sizeof(command));
 
         if (same_word(command, "CLOSE") || same_word(command, "X")) {
@@ -1022,10 +1078,10 @@ static void terminal_window(const char *username)
             for (int row = 0; row < TERM_ROWS; row++) log[row][0] = '\0';
             term_add(log, "TERMINAL CLEARED");
         } else if (same_word(command, "HELP")) {
-            term_add(log, "LINUX SHELL: LS, PWD, CD, CAT, SH");
+            term_add(log, "GUEST: LS PWD CD CAT WRITE MKDIR RM DISK");
             term_add(log, "WINDOW: MAXIMIZE MINIMIZE RESTORE CLOSE");
         } else if (command[0]) {
-            terminal_host_command(command, log);
+            terminal_guest_command(command, log);
         }
     }
 }
@@ -1053,7 +1109,7 @@ void gui_desktop(const char *username)
             gui_context_open = 0;
         } else if (same_word(command, "COMPUTER")) {
             gui_menu_open = 0;
-            draw_app_window("COMPUTER", "THIS PC", "SYSTEM DISK: NOT READY", "FILESYSTEM DRIVER IS BEING BUILT");
+            draw_app_window("COMPUTER", "THIS PC", "SYSTEM DISK: IRAQFS READY", "USE TURTULE TERMINAL FOR FILES");
             wait_return();
         } else if (same_word(command, "SETTINGS")) {
             gui_menu_open = 0;

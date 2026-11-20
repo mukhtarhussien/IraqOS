@@ -21,9 +21,11 @@ struct virtio_input_event
     uint32_t value;
 };
 
-void virtio_input_init(void);
+void virtio_input_init(const void *fdt);
 int virtio_input_ready(void);
 int virtio_input_next_event(struct virtio_input_event *event);
 void virtio_input_kick(void);
+int virtio_keyboard_ready(void);
+int virtio_keyboard_next_event(struct virtio_input_event *event);
 
 #endif

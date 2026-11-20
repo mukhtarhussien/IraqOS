@@ -5,6 +5,7 @@
 _start:
     ldr x0, =stack_top
     mov sp, x0
+    ldr x0, =0x40000000
 
     bl boot_main
 

@@ -1,9 +1,6 @@
 #include "virtio_gpu.h"
+#include "virtio_mmio.h"
 #include "../Kernel/printk.h"
-
-#define VIRTIO_MMIO_BASE   0x0A000000
-#define VIRTIO_MMIO_STRIDE 0x200
-#define VIRTIO_MMIO_COUNT  32
 
 #define REG_MAGIC           0x000
 #define REG_DEVICE_ID       0x008
@@ -24,7 +21,6 @@
 #define REG_QUEUE_DEVICE_LOW  0x0A0
 #define REG_QUEUE_DEVICE_HIGH 0x0A4
 
-#define VIRTIO_MAGIC     0x74726976
 #define VIRTIO_GPU_ID    16
 
 #define STATUS_ACK          1
@@ -183,26 +179,6 @@ static void mmio_write(uint64_t base, uint32_t offset, uint32_t value)
 {
     volatile uint32_t *reg = (volatile uint32_t *)(base + offset);
     *reg = value;
-}
-
-static uint64_t find_gpu_device(void)
-{
-    for (int i = 0; i < VIRTIO_MMIO_COUNT; i++)
-    {
-        uint64_t base = VIRTIO_MMIO_BASE + (i * VIRTIO_MMIO_STRIDE);
-
-        uint32_t magic = mmio_read(base, REG_MAGIC);
-
-        if (magic != VIRTIO_MAGIC)
-            continue;
-
-        uint32_t device_id = mmio_read(base, REG_DEVICE_ID);
-
-        if (device_id == VIRTIO_GPU_ID)
-            return base;
-    }
-
-    return 0;
 }
 
 static int queue_setup(void)
@@ -378,13 +354,13 @@ int virtio_gpu_is_ready(void)
     return gpu_ready;
 }
 
-void virtio_gpu_init(void)
+void virtio_gpu_init(const void *fdt)
 {
     printk("VirtIO GPU: initializing\n");
 
     fb_clear(0x000000FF);
 
-    gpu_base = find_gpu_device();
+    gpu_base = virtio_mmio_find(fdt, VIRTIO_GPU_ID);
 
     if (gpu_base == 0)
     {

@@ -5,7 +5,7 @@ PROJECT="$BASE/IraqOS"
 KERNEL="$PROJECT/Bootloader/boot.elf"
 DISK="$BASE/vm/disk/iraqos.qcow2"
 
-export DISPLAY="${DISPLAY:-:0}"
+export DISPLAY="${DISPLAY:-:2}"
 "$BASE/build.sh"
 PIDFILE="$BASE/vm/iraqos.pid"
 VM_PID=
@@ -73,7 +73,8 @@ qemu-system-aarch64 \
     -device virtio-blk-device,drive=iraqosdisk \
     -device virtio-gpu-device \
     -device virtio-tablet-device \
-    -display sdl,show-cursor=on \
+    -device virtio-keyboard-device \
+    -display sdl,show-cursor=off \
     -full-screen \
     -kernel "$KERNEL" < /dev/tty &
 VM_PID=$!
